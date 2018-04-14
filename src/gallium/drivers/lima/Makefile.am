@@ -32,3 +32,20 @@ AM_CFLAGS = \
 noinst_LTLIBRARIES = liblima.la
 
 liblima_la_SOURCES = $(C_SOURCES)
+
+noinst_PROGRAMS = lima_compiler
+
+# XXX: Required due to the C++ sources in libnir
+nodist_EXTRA_lima_compiler_SOURCES = dummy.cpp
+lima_compiler_SOURCES = \
+	lima_cmdline.c
+
+lima_compiler_LDADD = \
+	liblima.la \
+	$(top_builddir)/src/gallium/auxiliary/libgallium.la \
+	$(top_builddir)/src/compiler/nir/libnir.la \
+	$(top_builddir)/src/compiler/glsl/libstandalone.la \
+	$(top_builddir)/src/util/libmesautil.la \
+	$(top_builddir)/src/mesa/libmesagallium.la \
+	$(GALLIUM_COMMON_LIB_DEPS) \
+	$(LIMA_LIBS)

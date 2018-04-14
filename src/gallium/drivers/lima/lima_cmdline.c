@@ -1,0 +1,267 @@
+/*
+ * Copyright (C) 2018 Lima Project
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice (including the next
+ * paragraph) shall be included in all copies or substantial portions of the
+ * Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <err.h>
+
+#include "compiler/glsl/standalone.h"
+#include "compiler/glsl/glsl_to_nir.h"
+#include "compiler/nir_types.h"
+
+#include "lima_screen.h"
+#include "lima_context.h"
+#include "lima_program.h"
+#include "lima_bo.h"
+#include "ir/lima_ir.h"
+
+   static void
+insert_sorted(struct exec_list *var_list, nir_variable *new_var)
+{
+   nir_foreach_variable(var, var_list) {
+      if (var->data.location > new_var->data.location) {
+         exec_node_insert_node_before(&var->node, &new_var->node);
+         return;
+      }
+   }
+   exec_list_push_tail(var_list, &new_var->node);
+}
+
+   static void
+sort_varyings(struct exec_list *var_list)
+{
+   struct exec_list new_list;
+   exec_list_make_empty(&new_list);
+   nir_foreach_variable_safe(var, var_list) {
+      exec_node_remove(&var->node);
+      insert_sorted(&new_list, var);
+   }
+   exec_list_move_nodes_to(&new_list, var_list);
+}
+
+   static int
+type_size(const struct glsl_type *type)
+{
+   return glsl_count_attribute_slots(type, false);
+}
+
+
+   static nir_shader *
+load_glsl(unsigned num_files, char* const* files, gl_shader_stage stage)
+{
+   static const struct standalone_options options = {
+      .glsl_version = 100,
+      .do_link = true,
+      .dump_ast = true,
+      .dump_hir = true,
+      .dump_lir = true,
+      .dump_builder = true,
+   };
+   struct gl_shader_program *prog;
+
+   prog = standalone_compile_shader(&options, num_files, files);
+   if (!prog)
+      errx(1, "couldn't parse `%s'", files[0]);
+
+   enum pipe_shader_type shader_type;
+   switch (stage) {
+      case MESA_SHADER_VERTEX:
+         shader_type = PIPE_SHADER_VERTEX;
+         printf("PIPE_SHADER_VERTEX\n");
+         break;
+      case MESA_SHADER_FRAGMENT:
+         shader_type = PIPE_SHADER_FRAGMENT;
+         printf("PIPE_SHADER_FRAGMENT\n");
+         break;
+      default:
+         errx(1, "unhandled shader stage: %d", stage);
+   }
+
+   nir_shader *nir = glsl_to_nir(prog, stage, lima_program_get_compiler_options(shader_type));
+
+   printf("nir_print_shader 1\n");
+   nir_print_shader(nir, stdout);
+
+   /* required NIR passes: */
+   /* TODO cmdline args for some of the conditional lowering passes? */
+
+   NIR_PASS_V(nir, nir_lower_io_to_temporaries,
+         nir_shader_get_entrypoint(nir),
+         true, true);
+   NIR_PASS_V(nir, nir_lower_global_vars_to_local);
+   NIR_PASS_V(nir, nir_split_var_copies);
+   NIR_PASS_V(nir, nir_lower_var_copies);
+
+   NIR_PASS_V(nir, nir_split_var_copies);
+   NIR_PASS_V(nir, nir_lower_var_copies);
+   NIR_PASS_V(nir, nir_lower_io_types);
+
+   switch (stage) {
+      case MESA_SHADER_VERTEX:
+         nir_assign_var_locations(&nir->inputs,
+               &nir->num_inputs,
+               type_size);
+
+         /* Re-lower global vars, to deal with any dead VS inputs. */
+         NIR_PASS_V(nir, nir_lower_global_vars_to_local);
+
+         sort_varyings(&nir->outputs);
+         nir_assign_var_locations(&nir->outputs,
+               &nir->num_outputs,
+               type_size);
+         break;
+      case MESA_SHADER_FRAGMENT:
+         sort_varyings(&nir->inputs);
+         nir_assign_var_locations(&nir->inputs,
+               &nir->num_inputs,
+               type_size);
+         nir_assign_var_locations(&nir->outputs,
+               &nir->num_outputs,
+               type_size);
+         break;
+      default:
+         errx(1, "unhandled shader stage: %d", stage);
+   }
+
+   nir_assign_var_locations(&nir->uniforms,
+         &nir->num_uniforms,
+         type_size);
+
+   NIR_PASS_V(nir, nir_lower_system_values);
+   NIR_PASS_V(nir, nir_lower_io, nir_var_all, type_size, 0);
+   NIR_PASS_V(nir, nir_lower_samplers, prog);
+
+   printf("nir_print_shader 2\n");
+   nir_print_shader(nir, stdout);
+
+   return nir;
+}
+
+static void print_usage(void)
+{
+   printf("Usage: lima_compiler [OPTIONS]... <(file.vert | file.frag)*>\n");
+   printf("    --verbose         - verbose compiler/debug messages\n");
+   printf("    --help            - show this message\n");
+}
+
+int main(int argc, char **argv)
+{
+   //   int ret = 0, n = 1;
+   int n = 1;
+   char *filenames[2];
+   int num_files = 0;
+   gl_shader_stage stage;
+
+   while (n < argc) {
+      if (!strcmp(argv[n], "--verbose")) {
+         n++;
+         continue;
+      }
+      if (!strcmp(argv[n], "--help")) {
+         print_usage();
+         return 0;
+      }
+
+      break;
+   }
+
+   while (n < argc) {
+      char *filename = argv[n];
+      char *ext = rindex(filename, '.');
+
+      if (strcmp(ext, ".frag") == 0) {
+         if (num_files >= ARRAY_SIZE(filenames))
+            errx(1, "too many GLSL files");
+         stage = MESA_SHADER_FRAGMENT;
+      } else if (strcmp(ext, ".vert") == 0) {
+         if (num_files >= ARRAY_SIZE(filenames))
+            errx(1, "too many GLSL files");
+         stage = MESA_SHADER_VERTEX;
+      } else {
+         print_usage();
+         return -1;
+      }
+
+      filenames[num_files++] = filename;
+
+      n++;
+   }
+
+   debug_checkpoint();
+
+   nir_shader *nir;
+   if (num_files > 0) {
+      nir = load_glsl(num_files, filenames, stage);
+   } else {
+      print_usage();
+      return -1;
+   }
+
+   lima_shader_debug_gp = true;
+   lima_shader_debug_pp = true;
+
+   switch (nir->info.stage) {
+      case MESA_SHADER_FRAGMENT:
+         {
+            struct lima_fs_shader_state *so = rzalloc(NULL, struct lima_fs_shader_state);
+            if (!so)
+               return -1;
+
+            lima_program_optimize_fs_nir(nir);
+
+            printf("nir_print_shader 3\n");
+            nir_print_shader(nir, stdout);
+
+            if (!ppir_compile_nir(so, nir, NULL)) {
+               ralloc_free(so);
+               return -1;
+            }
+         }
+         break;
+      case MESA_SHADER_VERTEX:
+         {
+            struct lima_vs_shader_state *so = rzalloc(NULL, struct lima_vs_shader_state);
+            if (!so)
+               return -1;
+
+            lima_program_optimize_vs_nir(nir);
+
+            printf("nir_print_shader 3\n");
+            nir_print_shader(nir, stdout);
+
+            if (!gpir_compile_nir(so, nir)) {
+               ralloc_free(so);
+               return -1;
+            }
+         }
+         break;
+
+      default:
+         errx(1, "unhandled shader stage: %d", nir->info.stage);
+   }
+}

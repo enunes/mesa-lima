@@ -26,8 +26,12 @@
 #define H_LIMA_PROGRAM
 
 #include "pipe/p_defines.h"
+#include "compiler/nir/nir.h"
 
 const void *lima_program_get_compiler_options(enum pipe_shader_type shader);
+
+void lima_program_optimize_vs_nir(struct nir_shader *s);
+void lima_program_optimize_fs_nir(struct nir_shader *s);
 
 bool lima_update_vs_state(struct lima_context *ctx);
 bool lima_update_fs_state(struct lima_context *ctx);
